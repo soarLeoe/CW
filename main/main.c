@@ -7,6 +7,10 @@
  *   MAX98357A DIN  -> ESP32-S3 GPIO21
  *   MAX98357A BCLK -> ESP32-S3 GPIO39
  *   MAX98357A LRC  -> ESP32-S3 GPIO2
+ *
+ * Network:
+ *   WiFi → MQTT → OneNET (China Mobile IoT platform)
+ *   HR + SpO2 data published every measurement cycle (~1s)
  */
 
 #include <stdio.h>
@@ -18,8 +22,15 @@
 #include "algorithm.h"
 #include "max98357.h"
 #include "audio_tone.h"
+#include "wifi_sta.h"
+#include "onenet_mqtt.h"
 
 static const char *TAG = "MAIN";
+
+/* --- WiFi credentials (modify for your network) --- */
+#define WIFI_SSID       "xLeno"
+#define WIFI_PASSWORD   "12345678"
+#define WIFI_TIMEOUT_MS 15000
 
 #define FINGER_THRESHOLD    50000
 #define HR_MIN             30
@@ -52,17 +63,41 @@ static bool read_one_sample(uint32_t *red, uint32_t *ir)
 
 /* -----------------------------------------------------------------------
  * Collect n samples at ~100 sps (10ms interval).
+ *
+ * Has a watchdog: if read_one_sample fails N consecutive times (sensor
+ * stopped producing samples — usually because I2S/MQTT bus activity
+ * corrupted MAX30102's MODE_CONFIG), call restart_measurement() to
+ * bring the sensor back.  Without this, the original `i--` retry loop
+ * would spin forever on sample 0.
  * --------------------------------------------------------------------- */
-static void collect_samples(uint32_t *red_buf, uint32_t *ir_buf, int n)
+#define COLLECT_MAX_FAIL  5
+
+static bool collect_samples(uint32_t *red_buf, uint32_t *ir_buf, int n)
 {
+    int consec_fail = 0;
+
     for (int i = 0; i < n; i++) {
         if (!read_one_sample(&red_buf[i], &ir_buf[i])) {
-            ESP_LOGW(TAG, "collect_samples: timeout at sample %d", i);
-            i--;
+            ESP_LOGW(TAG, "collect_samples: timeout at sample %d (fail %d/%d)",
+                     i, consec_fail + 1, COLLECT_MAX_FAIL);
+            if (++consec_fail >= COLLECT_MAX_FAIL) {
+                ESP_LOGE(TAG, "Sensor not producing data, restarting measurement...");
+                maxim_max30102_dump_regs();
+                if (!maxim_max30102_restart_measurement()) {
+                    ESP_LOGE(TAG, "restart_measurement failed, aborting collect");
+                    return false;
+                }
+                consec_fail = 0;
+                /* Don't advance i — retry this sample slot */
+            }
+            i--;   /* retry same slot */
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        consec_fail = 0;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    return true;
 }
 
 /* -----------------------------------------------------------------------
@@ -199,7 +234,21 @@ void app_main(void)
     int32_t n_sp02;
     int8_t  ch_spo2_valid;
 
-    ESP_LOGI(TAG, "=== ESP32-S3 Health Monitor (MAX30102 + MAX98357A) ===");
+    ESP_LOGI(TAG, "=== ESP32-S3 Health Monitor (MAX30102 + MAX98357A + OneNET) ===");
+
+    /* --- Connect WiFi --- */
+    ESP_LOGI(TAG, "Connecting to WiFi \"%s\" ...", WIFI_SSID);
+    esp_err_t wifi_ret = wifi_sta_connect(WIFI_SSID, WIFI_PASSWORD,
+                                          WIFI_TIMEOUT_MS);
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi connect failed, cloud upload disabled.");
+    }
+
+    /* --- Initialize OneNET MQTT --- */
+    esp_err_t mqtt_ret = onenet_mqtt_init();
+    if (mqtt_ret != ESP_OK) {
+        ESP_LOGE(TAG, "OneNET MQTT init failed.");
+    }
 
     /* --- Initialise MAX98357A audio amplifier --- */
     esp_err_t audio_ret = max98357_init(MAX98357_SAMPLE_RATE);
@@ -237,7 +286,14 @@ void app_main(void)
 
     /* --- Phase 1: collect first 500 samples --- */
     ESP_LOGI(TAG, "Collecting 500 samples (~5s)...");
-    collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE);
+    if (!collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE)) {
+        ESP_LOGE(TAG, "Initial collect failed, retrying after restart...");
+        maxim_max30102_restart_measurement();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (!collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE)) {
+            ESP_LOGE(TAG, "Collect failed twice, continuing anyway...");
+        }
+    }
     ESP_LOGI(TAG, "First 500 samples done.");
     dump_samples(aun_red_buffer, aun_ir_buffer, 10);
 
@@ -259,7 +315,15 @@ void app_main(void)
         }
 
         /* Collect 100 new samples */
-        collect_samples(&aun_red_buffer[400], &aun_ir_buffer[400], 100);
+        if (!collect_samples(&aun_red_buffer[400], &aun_ir_buffer[400], 100)) {
+            ESP_LOGE(TAG, "Incremental collect failed, sensor may be dead.");
+            ESP_LOGI(TAG, "Attempting full restart + signal-stable...");
+            maxim_max30102_restart_measurement();
+            wait_for_signal_stable();
+            ESP_LOGI(TAG, "Recollecting 500 samples...");
+            collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE);
+            continue;
+        }
 
         /* Check finger */
         if (!finger_present(&aun_ir_buffer[400], 100)) {
@@ -272,7 +336,12 @@ void app_main(void)
             maxim_max30102_restart_measurement();
             wait_for_signal_stable();
             ESP_LOGI(TAG, "Recollecting 500 samples...");
-            collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE);
+            if (!collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE)) {
+                ESP_LOGE(TAG, "Recollect after finger loss failed, retrying...");
+                maxim_max30102_restart_measurement();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                collect_samples(aun_red_buffer, aun_ir_buffer, BUFFER_SIZE);
+            }
             continue;
         }
 
@@ -299,5 +368,9 @@ void app_main(void)
             ESP_LOGW(TAG, "HR = --  (raw HR=%ld, valid=%d)",
                      (long)n_heart_rate, (int)ch_hr_valid);
         }
+
+        /* --- Publish to OneNET --- */
+        onenet_mqtt_publish_hr_spo2(n_heart_rate, hr_ok,
+                                    n_sp02, spo2_ok);
     }
 }
