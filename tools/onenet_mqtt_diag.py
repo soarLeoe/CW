@@ -22,9 +22,9 @@ except ImportError:
     sys.exit(1)
 
 # ============================================================
-PRODUCT_ID  = "5hbIwupOGf"
-DEVICE_NAME = "ESP32S3_HR_01"
-ACCESS_KEY  = "QzhCRnhtQ2NnMW9HcFVOaXh5elQwdmFMdjlRWE9NbzA="
+PRODUCT_ID  = "NuuS3vUVz5"
+DEVICE_NAME = "ESP32S3_HR_02"
+ACCESS_KEY  = "QzZCNklSMmFuYWQ3ZHhISjVaTkJmR0JDck5LVHlvRVA="
 BROKER      = "mqtts.heclouds.com"
 PORT        = 1883
 EXPIRE_DAYS = 365 * 5

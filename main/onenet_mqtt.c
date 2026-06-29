@@ -191,3 +191,38 @@ bool onenet_mqtt_is_connected(void)
 {
     return s_mqtt_connected;
 }
+
+esp_err_t onenet_mqtt_publish_noise_level(float dbfs)
+{
+    if (!s_mqtt_connected) {
+        ESP_LOGW(TAG, "MQTT not connected, skipping publish");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Treat out-of-range low values as "no valid reading yet" and skip. */
+    if (dbfs < -90.0f) {
+        ESP_LOGD(TAG, "noise_level %.1f dBFS below threshold, skip", dbfs);
+        return ESP_OK;
+    }
+
+    /* Clamp to the physical range reported in the thing model. */
+    if (dbfs > 0.0f) dbfs = 0.0f;
+
+    char payload[128];
+    int len = snprintf(payload, sizeof(payload),
+                       "{\"id\":\"%d\",\"version\":\"1.0\",\"params\":{"
+                       "\"noise_level\":{\"value\":%.1f}"
+                       "}}",
+                       ++s_msg_id, dbfs);
+
+    int msg_id = esp_mqtt_client_publish(
+        s_client, s_topic_post, payload, len, 1, 0);
+
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Publish noise_level failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Published [id=%d]: %s", s_msg_id, payload);
+    return ESP_OK;
+}

@@ -31,8 +31,8 @@ import time
 #  ProductID:  产品开发 -> 产品详情 -> 产品ID
 #  ACCESS_KEY: 产品开发 -> 产品详情 -> access_key (产品级!)
 # ============================================================
-PRODUCT_ID  = "5hbIwupOGf"
-ACCESS_KEY  = "QzhCRnhtQ2NnMW9HcFVOaXh5elQwdmFMdjlRWE9NbzA="
+PRODUCT_ID  = "NuuS3vUVz5"
+ACCESS_KEY  = "QzZCNklSMmFuYWQ3ZHhISjVaTkJmR0JDck5LVHlvRVA="
 EXPIRE_DAYS = 365 * 5
 # ============================================================
 

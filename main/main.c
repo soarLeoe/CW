@@ -1,5 +1,6 @@
 /*
- * main.c — MAX30102 heart-rate detection + MAX98357A audio on ESP32-S3 (ESP-IDF v5.3)
+ * main.c — MAX30102 heart-rate detection + MAX98357A audio + INMP441 mic
+ *          on ESP32-S3 (ESP-IDF v5.3)
  *
  * Hardware connections:
  *   MAX30102 SDA  ->  ESP32-S3 GPIO11
@@ -7,10 +8,19 @@
  *   MAX98357A DIN  -> ESP32-S3 GPIO21
  *   MAX98357A BCLK -> ESP32-S3 GPIO39
  *   MAX98357A LRC  -> ESP32-S3 GPIO2
+ *   INMP441 SCK  ->   ESP32-S3 GPIO14
+ *   INMP441 WS   ->   ESP32-S3 GPIO15
+ *   INMP441 SD   ->   ESP32-S3 GPIO16   (INMP441 OUT -> ESP32 IN)
+ *   INMP441 L/R  ->   GND               (left channel)
  *
  * Network:
  *   WiFi → MQTT → OneNET (China Mobile IoT platform)
  *   HR + SpO2 data published every measurement cycle (~1s)
+ *
+ * Audio:
+ *   MAX98357A plays boot/beep tones on I2S_NUM_0 (TX).
+ *   INMP441 captures ambient audio on I2S_NUM_1 (RX) in an independent
+ *   task; current dBFS / VU level is logged every ~5s.
  */
 
 #include <stdio.h>
@@ -24,6 +34,8 @@
 #include "audio_tone.h"
 #include "wifi_sta.h"
 #include "onenet_mqtt.h"
+#include "inmp441.h"
+#include "mic_recorder.h"
 
 static const char *TAG = "MAIN";
 
@@ -39,6 +51,34 @@ static const char *TAG = "MAIN";
 /* Sample buffers — 500 samples = 5 seconds @ 100 sps */
 static uint32_t aun_ir_buffer[BUFFER_SIZE];
 static uint32_t aun_red_buffer[BUFFER_SIZE];
+
+/* -----------------------------------------------------------------------
+ * Mic level uploader task — independent of the HR main loop.
+ *
+ * Why this exists: the HR main loop blocks for long stretches
+ * (wait_for_finger can stall for minutes; collect_samples recovery takes
+ * 30+ seconds). If dBFS publishing lived in the main loop, the mic level
+ * would stop being reported every time the finger left the sensor or the
+ * MAX30102 needed a restart. By running the uploader as its own task on
+ * core 1 (alongside mic_recorder), HR state never affects noise reporting.
+ * --------------------------------------------------------------------- */
+#define MIC_UPLOADER_STACK_BYTES   (3 * 1024)
+#define MIC_UPLOADER_PRIO          3
+#define MIC_UPLOADER_INTERVAL_MS   1000
+
+static StaticTask_t s_mic_uploader_tcb;
+static StackType_t  s_mic_uploader_stack[MIC_UPLOADER_STACK_BYTES / sizeof(StackType_t)];
+
+static void mic_uploader_task(void *arg)
+{
+    ESP_LOGI(TAG, "mic_uploader task started on core 1");
+    while (1) {
+        if (onenet_mqtt_is_connected()) {
+            onenet_mqtt_publish_noise_level(mic_recorder_get_level_db());
+        }
+        vTaskDelay(pdMS_TO_TICKS(MIC_UPLOADER_INTERVAL_MS));
+    }
+}
 
 /* -----------------------------------------------------------------------
  * Read one sample from FIFO. Blocks up to ~1s waiting for data.
@@ -260,6 +300,33 @@ void app_main(void)
                  esp_err_to_name(audio_ret));
     }
 
+    /* --- Initialise INMP441 microphone (I2S_NUM_1 RX, independent task) --- */
+    /* Runs on its own FreeRTOS task pinned to core 1, so it does not block
+     * the HR-detection main loop on core 0. MAX98357A uses I2S_NUM_0; the
+     * two I2S controllers are independent, so capture and playback can run
+     * concurrently. */
+    esp_err_t mic_ret = mic_recorder_init(INMP441_SAMPLE_RATE);
+    if (mic_ret == ESP_OK) {
+        ESP_LOGI(TAG, "INMP441 microphone ready (capture task running).");
+    } else {
+        ESP_LOGE(TAG, "INMP441 init failed: %s (mic disabled)",
+                 esp_err_to_name(mic_ret));
+    }
+
+    /* --- Start the mic level uploader task (independent of HR loop) ---
+     * Reports dBFS to OneNET every second regardless of HR/finger state.
+     * Pinned to core 1 alongside mic_recorder so core 0 stays free for HR. */
+    xTaskCreateStaticPinnedToCore(
+        mic_uploader_task,
+        "mic_upl",
+        MIC_UPLOADER_STACK_BYTES / sizeof(StackType_t),
+        NULL,
+        MIC_UPLOADER_PRIO,
+        s_mic_uploader_stack,
+        &s_mic_uploader_tcb,
+        1);
+    ESP_LOGI(TAG, "mic_uploader task created");
+
     /* --- Initialise MAX30102 heart-rate sensor --- */
     if (!maxim_max30102_init()) {
         ESP_LOGE(TAG, "MAX30102 init failed! Check wiring.");
@@ -372,5 +439,10 @@ void app_main(void)
         /* --- Publish to OneNET --- */
         onenet_mqtt_publish_hr_spo2(n_heart_rate, hr_ok,
                                     n_sp02, spo2_ok);
+
+        /* Note: dBFS publishing is handled by the independent mic_uploader
+         * task (started in app_main), NOT here. This keeps noise reporting
+         * running even when the HR loop stalls on wait_for_finger or
+         * collect_samples recovery. */
     }
 }
