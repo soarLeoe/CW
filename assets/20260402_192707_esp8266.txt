@@ -1,0 +1,23 @@
+AT+RST
+
+AT+CWMODE=3
+
+AT+CWJAP="xLeno","12345678"
+
+AT+MQTTUSERCFG=0,1,"NULL","device&k27ujxHlw1J","39410851bd7b4d010e160daaa7920df01358cef34ce9ae7d8443b6346774dc25",0,0,""
+
+AT+MQTTCLIENTID=0,"k27ujxHlw1J.device|securemode=2\,signmethod=hmacsha256\,timestamp=1751901152994|"
+
+
+AT+MQTTCONN=0,"iot-06z00dkmxm5alkg.mqtt.iothub.aliyuncs.com",1883,1
+
+
+AT+MQTTPUBRAW=0,"/sys/k27ujxHlw1J/device/thing/event/property/post",23,1,0
+
+{"params":{"temp":7}}
+
+
+AA 55 02 01 31 30 0D 0A
+
+
+AA +07 +F0 00 00 00 +校验和
