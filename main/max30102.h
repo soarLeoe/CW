@@ -43,4 +43,22 @@ bool maxim_max30102_write_reg(uint8_t uch_addr, uint8_t uch_data);
 bool maxim_max30102_read_reg(uint8_t uch_addr, uint8_t *puch_data);
 bool maxim_max30102_reset(void);
 
+/**
+ * Restart measurement: clear FIFO and re-write the measurement-mode
+ * registers (MODE_CONFIG, SPO2_CONFIG, LED PA, FIFO_CONFIG).
+ *
+ * Use this after events that may have corrupted the sensor's registers
+ * (e.g. I2S DMA bursts interfering with I2C). Does NOT re-run the full
+ * init (no bus re-creation, no part-ID check).
+ *
+ * @return true on success.
+ */
+bool maxim_max30102_restart_measurement(void);
+
+/**
+ * Dump key registers for diagnostics (MODE_CONFIG, SPO2_CONFIG,
+ * FIFO_CONFIG, FIFO_WR_PTR, FIFO_RD_PTR).
+ */
+void maxim_max30102_dump_regs(void);
+
 #endif /* MAX30102_H_ */

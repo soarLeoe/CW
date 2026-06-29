@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+.sdkconfig.old
+
+# IDE / editor cache
+.cache/
+.vscode/
+*.swp
+*.swo
+*~
+
+# clangd index
+.cache/clangd/
+
+# ESP-IDF sdkconfig overrides
+sdkconfig.old
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Binary outputs (in case they end up outside build/)
+*.bin
+*.elf
+*.map
+*.hex
+*.obj
+*.a
+!bootloader/*.bin

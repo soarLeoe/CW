@@ -13,13 +13,23 @@
 static const char *TAG = "MAX30102";
 
 static i2c_master_dev_handle_t s_dev_handle = NULL;
+static i2c_master_bus_handle_t s_bus_handle = NULL;
 
 #define I2C_RETRY_COUNT     3
 #define I2C_RETRY_DELAY_MS  10
 
 /* -----------------------------------------------------------------------
- * Internal I2C helpers (with retry)
+ * Internal I2C helpers (with retry + bus recovery)
  * --------------------------------------------------------------------- */
+
+/* Reset the I2C bus by clocking 9 pulses to release a stuck slave. */
+static void i2c_bus_recover(void)
+{
+    if (s_bus_handle == NULL) return;
+    ESP_LOGW(TAG, "Recovering I2C bus...");
+    i2c_master_bus_reset(s_bus_handle);
+    vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
+}
 
 static bool i2c_write_reg(uint8_t reg, uint8_t value)
 {
@@ -29,6 +39,7 @@ static bool i2c_write_reg(uint8_t reg, uint8_t value)
         if (ret == ESP_OK) return true;
         ESP_LOGW(TAG, "i2c_write_reg(0x%02X) attempt %d failed: %s",
                  reg, attempt + 1, esp_err_to_name(ret));
+        i2c_bus_recover();
         vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
     }
     ESP_LOGE(TAG, "i2c_write_reg(0x%02X) failed after %d retries", reg, I2C_RETRY_COUNT);
@@ -44,6 +55,7 @@ static bool i2c_read_reg(uint8_t reg, uint8_t *value)
         if (ret == ESP_OK) return true;
         ESP_LOGW(TAG, "i2c_read_reg(0x%02X) attempt %d failed: %s",
                  reg, attempt + 1, esp_err_to_name(ret));
+        i2c_bus_recover();
         vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
     }
     ESP_LOGE(TAG, "i2c_read_reg(0x%02X) failed after %d retries", reg, I2C_RETRY_COUNT);
@@ -90,6 +102,7 @@ bool maxim_max30102_init(void)
         ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(ret));
         return false;
     }
+    s_bus_handle = bus_handle;   /* saved for bus recovery */
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -162,6 +175,9 @@ bool maxim_max30102_read_fifo(uint32_t *pun_red_led, uint32_t *pun_ir_led)
             ESP_LOGE(TAG, "read_fifo failed: %s", esp_err_to_name(ret));
             return false;
         }
+        ESP_LOGW(TAG, "read_fifo attempt %d failed: %s, recovering bus",
+                 attempt + 1, esp_err_to_name(ret));
+        i2c_bus_recover();
         vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
     }
 
@@ -188,4 +204,46 @@ bool maxim_max30102_read_fifo(uint32_t *pun_red_led, uint32_t *pun_ir_led)
     *pun_ir_led  &= 0x03FFFF;
 
     return true;
+}
+
+/* ----------------------------------------------------------------------- */
+/*  Restart measurement (after I2S interference etc.)                      */
+/* ----------------------------------------------------------------------- */
+
+bool maxim_max30102_restart_measurement(void)
+{
+    ESP_LOGI(TAG, "Restarting measurement (re-writing mode registers)...");
+
+    /* Clear FIFO pointers */
+    if (!i2c_write_reg(REG_FIFO_WR_PTR,   0x00)) return false;
+    if (!i2c_write_reg(REG_OVF_COUNTER,   0x00)) return false;
+    if (!i2c_write_reg(REG_FIFO_RD_PTR,   0x00)) return false;
+
+    /* Clear interrupt status */
+    uint8_t tmp;
+    i2c_read_reg(REG_INTR_STATUS_1, &tmp);
+    i2c_read_reg(REG_INTR_STATUS_2, &tmp);
+
+    /* Re-write configuration registers (these may have been corrupted) */
+    if (!i2c_write_reg(REG_FIFO_CONFIG,   0x0F)) return false; /* no avg, rollover off */
+    if (!i2c_write_reg(REG_MODE_CONFIG,   0x03)) return false; /* SpO2 mode — STARTS sampling */
+    if (!i2c_write_reg(REG_SPO2_CONFIG,   0x27)) return false; /* ADC 4096, 100sps, 400us */
+    if (!i2c_write_reg(REG_LED1_PA,       0x24)) return false; /* RED ~7mA */
+    if (!i2c_write_reg(REG_LED2_PA,       0x24)) return false; /* IR ~7mA */
+    if (!i2c_write_reg(REG_PILOT_PA,      0x7F)) return false;
+
+    ESP_LOGI(TAG, "Measurement restarted: SpO2 mode, 100 sps");
+    return true;
+}
+
+void maxim_max30102_dump_regs(void)
+{
+    uint8_t mode = 0, spo2 = 0, fifo_cfg = 0, wr = 0, rd = 0;
+    i2c_read_reg(REG_MODE_CONFIG,   &mode);
+    i2c_read_reg(REG_SPO2_CONFIG,   &spo2);
+    i2c_read_reg(REG_FIFO_CONFIG,   &fifo_cfg);
+    i2c_read_reg(REG_FIFO_WR_PTR,   &wr);
+    i2c_read_reg(REG_FIFO_RD_PTR,   &rd);
+    ESP_LOGI(TAG, "REGS: MODE=0x%02X SPO2=0x%02X FIFO_CFG=0x%02X WR=%d RD=%d",
+             mode, spo2, fifo_cfg, wr & 0x1F, rd & 0x1F);
 }
